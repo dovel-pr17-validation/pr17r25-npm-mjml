@@ -1,0 +1,135 @@
+/* eslint-disable no-console */
+import chokidar from 'chokidar'
+import { sync } from 'glob'
+import { match } from 'minimatch'
+import path from 'path'
+import mjml2html from 'mjml-core'
+import { flow, pickBy, flatMap, uniq, difference, remove } from 'lodash/fp'
+
+import readFile from './readFile'
+import makeOutputToFile from './outputToFile'
+import fileContext from '../helpers/fileContext'
+
+let dirty = []
+
+const _flatMap = flatMap.convert({ cap: false }) // eslint-disable-line no-underscore-dangle
+const flatMapAndJoin = _flatMap((v, k) => v.map((p) => path.join(k, p)))
+const flatMapKeyAndValues = flow(
+  _flatMap((v, k) => [k, ...v]),
+  uniq,
+)
+
+// chokidar v4 no longer expands glob patterns itself, so watch the nearest
+// non-glob ancestor directory instead and let the existing add/change
+// handlers filter matches against the original input patterns.
+const hasMagic = (segment) => /[*?{}[\]!()]/.test(segment)
+const globBase = (pattern) => {
+  const segments = pattern.split('/')
+  const magicIndex = segments.findIndex(hasMagic)
+  if (magicIndex === -1) {
+    return pattern
+  }
+  return segments.slice(0, magicIndex).join('/') || '.'
+}
+
+export default (input, options) => {
+  const dependencies = {}
+  const outputToFile = makeOutputToFile(options.o)
+  const baseRoots = input.map((i) => path.resolve(globBase(i.replace(/\\/g, '/'))))
+  const isUnderBaseRoot = (filePath) =>
+    baseRoots.some(
+      (root) => filePath === root || filePath.startsWith(`${root}${path.sep}`),
+    )
+  const getRelatedFiles = (file) =>
+    flow(
+      pickBy((v, k) => k === file || v.indexOf(file) !== -1),
+      Object.keys,
+    )(dependencies)
+  const synchronyzeWatcher = (filePath) => {
+    getRelatedFiles(filePath).forEach((f) => {
+      dependencies[f] = fileContext(f, options.config.filePath)
+
+      if (dirty.indexOf(f) === -1) {
+        dirty.push(f)
+      }
+    })
+
+    /* eslint-disable no-use-before-define */
+    const files = {
+      toWatch: flatMapKeyAndValues(dependencies),
+      // Never prune paths under the originally-watched roots: sibling input
+      // files not yet registered in `dependencies` must stay watched too.
+      watched: flatMapAndJoin(watcher.getWatched()).filter(
+        (p) => !isUnderBaseRoot(p),
+      ),
+    }
+
+    watcher.add(difference(files.toWatch, files.watched))
+    watcher.unwatch(difference(files.watched, files.toWatch))
+    /* eslint-enable no-use-before-define */
+  }
+  const readAndCompile = async (file) => {
+    const { config } = options
+    const beautify = config.beautify && config.beautify !== 'false'
+    const minify = config.minify && config.minify !== 'false'
+    const content = readFile(file).mjml
+    const compiled = await mjml2html(content, {
+      ...config,
+      beautify,
+      minify,
+      filePath: file,
+      actualPath: file,
+    })
+
+    compiled.errors.forEach((e) => console.warn(e.formattedMessage))
+
+    try {
+      await outputToFile({ file, compiled })
+      console.log(`${file} - Successfully compiled`)
+    } catch (e) {
+      console.log(`${file} - Error while compiling file`)
+    }
+  }
+
+  const watcher = chokidar
+    .watch(input.map((i) => globBase(i.replace(/\\/g, '/'))))
+    .on('change', (file) => synchronyzeWatcher(path.resolve(file)))
+    .on('add', (file) => {
+      const filePath = path.resolve(file)
+      console.log(`Now watching file: ${filePath}`)
+
+      const matchInputOption = input.reduce(
+        (found, file) =>
+          found || match(sync(path.resolve(file)), filePath)?.length > 0,
+        false,
+      )
+
+      if (matchInputOption) {
+        dependencies[filePath] = getRelatedFiles(filePath)
+      }
+
+      synchronyzeWatcher(filePath)
+    })
+    .on('unlink', (file) => {
+      const filePath = path.resolve(file)
+
+      delete dependencies[path.resolve(filePath)]
+
+      remove(dirty, (f) => f === filePath)
+
+      synchronyzeWatcher(filePath)
+    })
+
+  setInterval(() => {
+    dirty.forEach((f) => {
+      console.log(`${f} - Change detected`)
+      readAndCompile(f).catch((e) => {
+        console.log(`${f} - Error while rendering the file : `, e)
+      })
+    })
+    dirty = []
+  }, 500)
+
+  return []
+}
+/* eslint-enable no-console */

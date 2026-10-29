@@ -1,0 +1,18 @@
+{
+  "packages": [
+    "packages/*"
+  ],
+  "command": {
+    "publish": {
+      "exact": true
+    },
+    "run": {
+      "stream": true,
+      "parallel": true,
+      "concurrency": 1
+    }
+  },
+  "npmClient": "yarn",
+  "useWorkspaces": true,
+  "version": "5.4.1"
+}

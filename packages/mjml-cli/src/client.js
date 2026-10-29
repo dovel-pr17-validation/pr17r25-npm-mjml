@@ -1,0 +1,425 @@
+import path from 'path'
+import yargs from 'yargs'
+import { flow, pick, isNil, negate, pickBy } from 'lodash/fp'
+import { isArray, isEmpty, map, get } from 'lodash'
+
+import mjml2htmlCore, { components, initializeType, assignComponents } from 'mjml-core'
+import validate, { dependencies, assignDependencies } from 'mjml-validator'
+import presetCore from 'mjml-preset-core'
+import MJMLParser from 'mjml-parser-xml'
+
+import { version as coreVersion } from 'mjml-core/package.json'
+import readFile, { flatMapPaths } from './commands/readFile'
+import watchFiles from './commands/watchFiles'
+import readStream from './commands/readStream'
+import outputToFile, { isDirectory } from './commands/outputToFile'
+import outputToConsole from './commands/outputToConsole'
+
+import { version as cliVersion } from '../package.json'
+import DEFAULT_OPTIONS from './helpers/defaultOptions'
+
+const beautifyConfig = {
+  indent_size: 2,
+  wrap_attributes_indent_size: 2,
+  max_preserve_newline: 0,
+  preserve_newlines: false,
+  end_with_newline: true,
+}
+
+const minifyConfig = {
+  collapseWhitespace: true,
+  minifyCss: false,
+  caseSensitive: true,
+  removeEmptyAttributes: true,
+}
+
+export default async () => {
+  let EXIT_CODE = 0
+  let KEEP_OPEN = false
+
+  const error = (msg) => {
+    console.error('\nCommand line error:') // eslint-disable-line no-console
+    console.error(msg) // eslint-disable-line no-console
+
+    process.exit(1)
+  }
+
+  const pickArgs = (args) =>
+    flow(
+      pick(args),
+      pickBy((e) => negate(isNil)(e) && !(isArray(e) && isEmpty(e))),
+    )
+
+  const { argv } = yargs
+    .version(false) // cf. https://github.com/yargs/yargs/issues/961
+    .options({
+      r: {
+        alias: 'read',
+        describe: 'Compile MJML File(s)',
+        type: 'array',
+      },
+      v: {
+        alias: 'validate',
+        describe: 'Run validator on File(s)',
+        type: 'array',
+      },
+      w: {
+        alias: 'watch',
+        type: 'array',
+        describe: 'Watch and compile MJML File(s) when modified',
+      },
+      i: {
+        alias: 'stdin',
+        describe: 'Compiles MJML from input stream',
+      },
+      s: {
+        alias: 'stdout',
+        type: 'boolean',
+        describe: 'Output HTML to stdout',
+      },
+      o: {
+        alias: 'output',
+        type: 'string',
+        describe: 'Filename/Directory to output compiled files',
+      },
+      c: {
+        alias: 'config',
+        type: 'object',
+        describe: 'Option to pass to mjml-core',
+      },
+      sanitizeStyles: {
+        type: 'boolean',
+        describe:
+          'Sanitize template variables inside CSS before minification',
+      },
+      version: {
+        alias: 'V',
+      },
+      noStdoutFileComment: {
+        type: 'boolean',
+        describe: 'Add no file comment to stdout',
+      },
+    })
+    .help()
+    .version(`mjml-core: ${coreVersion}\nmjml-cli: ${cliVersion}`)
+
+  let juiceOptions
+  let minifyOptions
+  let juicePreserveTags
+  let fonts
+  let templateSyntax
+  let includePath
+
+  try {
+    juiceOptions =
+      argv.c && argv.c.juiceOptions && JSON.parse(argv.c.juiceOptions)
+  } catch (e) {
+    error(`Failed to decode JSON for config.juiceOptions argument`)
+  }
+
+  try {
+    minifyOptions =
+      argv.c && argv.c.minifyOptions && JSON.parse(argv.c.minifyOptions)
+  } catch (e) {
+    error(`Failed to decode JSON for config.minifyOptions argument`)
+  }
+
+  try {
+    juicePreserveTags =
+      argv.c && argv.c.juicePreserveTags && JSON.parse(argv.c.juicePreserveTags)
+  } catch (e) {
+    error(`Failed to decode JSON for config.juicePreserveTags argument`)
+  }
+
+  try {
+    fonts = argv.c && argv.c.fonts && JSON.parse(argv.c.fonts)
+  } catch (e) {
+    error(`Failed to decode JSON for config.fonts argument`)
+  }
+
+  try {
+    templateSyntax =
+      argv.c && argv.c.templateSyntax && JSON.parse(argv.c.templateSyntax)
+  } catch (e) {
+    error(`Failed to decode JSON for config.templateSyntax argument`)
+  }
+
+  // Support includePath as string or JSON array in CLI
+  includePath = argv.c && argv.c.includePath
+  if (typeof includePath === 'string') {
+    try {
+      includePath = JSON.parse(includePath)
+    } catch (_) {
+      // keep as string when not JSON
+    }
+  }
+
+  // Resolve relative includePath entries to absolute paths using the CLI's
+  // working directory (process.cwd()), not the template file's directory.
+  // This matches the intuitive expectation that `--config.includePath '["layouts"]'`
+  // refers to a folder relative to where the CLI command is run.
+  const resolveIncludePathEntry = (p) => {
+    if (typeof p === 'string' && p.length > 0 && !path.isAbsolute(p)) {
+      return path.resolve(process.cwd(), p)
+    }
+    return p
+  }
+  if (Array.isArray(includePath)) {
+    includePath = includePath.map(resolveIncludePathEntry)
+  } else if (typeof includePath === 'string' && includePath.length > 0) {
+    includePath = resolveIncludePathEntry(includePath)
+  }
+
+  const filePath = argv.c && argv.c.filePath
+
+  const config = Object.assign(
+    DEFAULT_OPTIONS,
+    argv.c,
+    fonts && { fonts },
+    minifyOptions && { minifyOptions },
+    juiceOptions && { juiceOptions },
+    juicePreserveTags && { juicePreserveTags },
+    templateSyntax && { templateSyntax },
+    typeof includePath !== 'undefined' && { includePath },
+    argv.c && argv.c.keepComments === 'false' && { keepComments: false },
+  )
+
+  const configAllowIncludes =
+    argv.c && (argv.c.allowIncludes === true || argv.c.allowIncludes === 'true')
+  if (configAllowIncludes) {
+    config.ignoreIncludes = false
+  }
+
+  if (typeof config.sanitizeStyles === 'string') {
+    config.sanitizeStyles = config.sanitizeStyles === 'true'
+  }
+  if (typeof config.allowMixedSyntax === 'string') {
+    config.allowMixedSyntax = config.allowMixedSyntax === 'true'
+  }
+  if (typeof config.minify === 'string') {
+    config.minify = config.minify === 'true'
+  }
+
+  if (typeof argv.sanitizeStyles !== 'undefined') {
+    config.sanitizeStyles = argv.sanitizeStyles
+  }
+
+  const inputArgs = pickArgs(['r', 'w', 'i', '_', 'm', 'v'])(argv)
+  const outputArgs = pickArgs(['o', 's'])(argv)
+
+  assignComponents(components, presetCore.components)
+  assignDependencies(dependencies, presetCore.dependencies)
+
+  // implies (until yargs pr is accepted)
+  ;[
+    [Object.keys(inputArgs).length === 0, 'No input argument received'],
+    [Object.keys(inputArgs).length > 1, 'Too many input arguments received'],
+    [Object.keys(outputArgs).length > 1, 'Too many output arguments received'],
+    [
+      argv.w && argv.w.length > 1 && !argv.o,
+      'Need an output option when watching files',
+    ],
+    [
+      argv.w &&
+        argv.w.length > 1 &&
+        argv.o &&
+        !isDirectory(argv.o) &&
+        argv.o !== '',
+      'Need an output option when watching files',
+    ],
+  ].forEach((v) => (v[0] ? error(v[1]) : null))
+
+  const inputOpt = Object.keys(inputArgs)[0]
+  const outputOpt = Object.keys(outputArgs)[0] || 's'
+
+  const inputFiles = isArray(inputArgs[inputOpt])
+    ? inputArgs[inputOpt]
+    : [inputArgs[inputOpt]]
+  const inputs = []
+
+  switch (inputOpt) {
+    case 'r':
+    case 'v':
+    case 'm':
+    case '_': {
+      flatMapPaths(inputFiles).forEach((file) => {
+        inputs.push(readFile(file))
+      })
+
+      if (!inputs.length) {
+        error('No input files found')
+        return
+      }
+      break
+    }
+    case 'w':
+      watchFiles(inputFiles, {
+        ...argv,
+        config,
+        minifyConfig,
+        beautifyConfig,
+      })
+      KEEP_OPEN = true
+      break
+    case 'i':
+      inputs.push(await readStream())
+      break
+    default:
+      error('Command line error: Incorrect input options')
+  }
+
+  const convertedStream = []
+  const failedStream = []
+
+  // eslint-disable-next-line guard-for-in
+  for (const i of inputs) {
+    try {
+      let compiled
+      switch (inputOpt) {
+        case 'v': // eslint-disable-next-line no-case-declarations
+          const mjmlJson = MJMLParser(i.mjml, {
+            components,
+            filePath: filePath || i.file,
+            actualPath: i.file,
+          })
+          compiled = {
+            errors: validate(mjmlJson, {
+              dependencies,
+              components,
+              initializeType,
+            }),
+          }
+          break
+
+        default: {
+          const beautify = config.beautify && config.beautify !== 'false'
+          const minify = config.minify && config.minify !== 'false'
+
+          // eslint-disable-next-line no-await-in-loop
+          compiled = await mjml2htmlCore(i.mjml, {
+            ...config,
+            minify,
+            beautify,
+            beautifyConfig,
+            minifyConfig,
+            useMjmlConfigOptions: config?.useMjmlConfigOptions ?? false,
+            filePath: filePath || i.file,
+            actualPath: i.file,
+          })
+        }
+      }
+
+      convertedStream.push({ ...i, compiled })
+    } catch (e) {
+      EXIT_CODE = 2
+      failedStream.push({ file: i.file, error: e })
+    }
+  }
+
+  convertedStream.forEach((s) => {
+    if (get(s, 'compiled.errors.length')) {
+      console.error(map(s.compiled.errors, 'formattedMessage').join('\n')) // eslint-disable-line no-console
+    }
+  })
+
+  // Warn when includes were enabled but some include paths were denied (outside allowed roots).
+  if (config.ignoreIncludes === false) {
+    const DENIED_RE = /<!--\s*mj-include denied\s*-->/i
+    const filesWithDeniedIncludes = convertedStream
+      .filter((s) => s.compiled && s.compiled.html && DENIED_RE.test(s.compiled.html))
+      .map((s) => s.file)
+    if (filesWithDeniedIncludes.length) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[MJML] Some mj-include paths were denied because they are outside the allowed directories.\n` +
+          `  Files: ${filesWithDeniedIncludes.join(', ')}\n` +
+          `  Add the include directories to --config.includePath to allow them.\n` +
+          `  See https://documentation.mjml.io/#mj-include for security notes.`,
+      )
+    }
+  }
+
+  // Warn when mj-include tags are present but includes are still ignored.
+  if (config.ignoreIncludes !== false) {
+    const MJ_INCLUDE_RE = /<mj-include\b/i
+    const filesWithIgnoredIncludes = inputs
+      .filter((i) => i && i.mjml && MJ_INCLUDE_RE.test(i.mjml))
+      .map((i) => i.file)
+    if (filesWithIgnoredIncludes.length) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[MJML] mj-include tags were found but includes are disabled by default.\n` +
+          `  Files: ${filesWithIgnoredIncludes.join(', ')}\n` +
+          `  To enable includes, add --config.allowIncludes true to your command.\n` +
+          `  See https://documentation.mjml.io/#mj-include for security notes.`,
+      )
+    }
+  }
+
+  failedStream.forEach(({ error, file }) => {
+    console.error(`${file ? `File: ${file}\n` : null}${error}`) // eslint-disable-line no-console
+
+    if (config.stack) {
+      console.error(error.stack) // eslint-disable-line no-console
+    }
+  })
+
+  if (inputOpt === 'v') {
+    const isInvalid =
+      failedStream.length ||
+      convertedStream.some((s) => !!get(s, 'compiled.errors.length'))
+
+    if (isInvalid) {
+      error('Validation failed')
+      return
+    }
+    process.exitCode = 0
+    return
+  }
+
+  if (!KEEP_OPEN && convertedStream.length === 0) {
+    error('Input file(s) failed to render')
+  }
+
+  switch (outputOpt) {
+    case 'o': {
+      if (inputs.length > 1 && !isDirectory(argv.o) && argv.o !== '') {
+        error(
+          `Multiple input files, but output option should be either an existing directory or an empty string: ${argv.o} given`,
+        )
+      }
+
+      const fullOutputPath = path.parse(path.resolve(process.cwd(), argv.o))
+
+      if (inputs.length === 1 && !isDirectory(fullOutputPath.dir)) {
+        error(`Output directory doesn’t exist for path : ${argv.o}`)
+      }
+
+      Promise.all(convertedStream.map(outputToFile(argv.o)))
+        .then(() => {
+          if (!KEEP_OPEN) {
+            process.exitCode = EXIT_CODE
+          }
+        })
+        .catch(({ outputName, err }) => {
+          if (!KEEP_OPEN) {
+            error(`Error writing file - ${outputName} : ${err}`)
+          }
+        })
+      break
+    }
+    case 's': {
+      const addFileHeaderComment = !argv.noStdoutFileComment
+      Promise.all(
+        convertedStream.map((converted) =>
+          outputToConsole(converted, addFileHeaderComment),
+        ),
+      )
+        .then(() => (process.exitCode = EXIT_CODE)) // eslint-disable-line no-return-assign
+        .catch(() => (process.exitCode = 1)) // eslint-disable-line no-return-assign
+      break
+    }
+    default:
+      error('Command line error: No output option available')
+  }
+}
